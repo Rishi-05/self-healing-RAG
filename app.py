@@ -1,315 +1,216 @@
-import os
 import sys
 import time
-import traceback
 from pathlib import Path
 
-import gradio as gr
-
+import streamlit as st
+import tempfile
 sys.path.append(str(Path(__file__).parent / "ingestion"))
 sys.path.append(str(Path(__file__).parent / "graph"))
 
-from ingest import ingest_pdf                      # noqa: E402
-from self_healing_graph import ask                  # noqa: E402
-from retrieve_generate import invalidate_bm25_cache  # noqa: E402
+from ingest import ingest_pdf                        # noqa: E402
+from self_healing_graph import ask                    # noqa: E402
+from retrieve_generate import invalidate_bm25_cache    # noqa: E402
 
 COLLECTION_NAME = "documents"
 
 CONFIDENCE_DOT_COLOR = {
-    "high": "#4FD1C5",
-    "medium": "#F2B84B",
-    "low": "#E8615B",
-    "none": "#4A5164",
+    "high": "#1F9D8A",
+    "medium": "#C9861A",
+    "low": "#C24C43",
+    "none": "#9AA0AC",
 }
 
-
-def render_retry_dots(retries: int, max_retries: int = 2) -> str:
-    dots = []
-    for i in range(max_retries):
-        filled = i < retries
-        color = "#F2B84B" if filled else "#2A3040"
-        dots.append(f'<span style="display:inline-block;width:8px;height:8px;'
-                    f'border-radius:50%;background:{color};margin-right:4px;"></span>')
-    return "".join(dots)
-
-
-def render_confidence_dot(label: str) -> str:
-    color = CONFIDENCE_DOT_COLOR.get(label, "#4A5164")
-    return (f'<span style="display:inline-block;width:9px;height:9px;'
-            f'border-radius:50%;background:{color};margin-right:6px;'
-            f'box-shadow:0 0 6px {color}66;"></span>')
-
-
-def handle_upload(pdf_file):
-    if pdf_file is None:
-        return "⚠ NO FILE — select a PDF before ingesting"
-    try:
-        start = time.time()
-        collection = ingest_pdf(pdf_file.name, collection_name=COLLECTION_NAME)
-        invalidate_bm25_cache(COLLECTION_NAME)
-        elapsed = time.time() - start
-        return (
-            f'<span style="color:#4FD1C5;">●</span> INGESTED in {elapsed:.1f}s &nbsp;·&nbsp; '
-            f'{collection.count()} chunks indexed &nbsp;·&nbsp; ready for questions'
-        )
-    except Exception as e:
-        return f'<span style="color:#E8615B;">●</span> INGEST FAILED — {e}'
-
-
-def handle_question(query, history):
-    if not query.strip():
-        return history, "", "", ""
-
-    try:
-        start = time.time()
-        result = ask(query, collection_name=COLLECTION_NAME)
-        elapsed = time.time() - start
-
-        answer = result["final_output"]
-        history = history + [
-            {"role": "user", "content": query},
-            {"role": "assistant", "content": answer},
-        ]
-
-        sources_md = "\n\n".join(
-            f"**[{i+1}]** `{c['source']}` — page {c['page']} "
-            f"&nbsp;·&nbsp; rerank score `{c['rerank_score']:.3f}`\n\n"
-            f"> {c['text'][:250]}{'...' if len(c['text']) > 250 else ''}"
-            for i, c in enumerate(result["chunks"])
-        ) or "_no chunks retrieved_"
-
-        conf = result["confidence"]
-        debug_md = (
-            f"{render_confidence_dot(conf['label'])}"
-            f"**CONFIDENCE** &nbsp;`{conf['label'].upper()}`"
-            f" &nbsp;·&nbsp; best rerank score `{conf['best_rerank_score']}`\n\n"
-            f"**VERDICT** &nbsp;`{(result['verdict'] or '—').upper()}`\n\n"
-            f"**RETRIES** &nbsp;{render_retry_dots(result['retry_count'])}"
-            f"&nbsp;{result['retry_count']} / 2\n\n"
-            f"**CRITIC NOTE** &nbsp;{result['critique_reason'] or '—'}\n\n"
-            f"**LATENCY** &nbsp;`{elapsed:.2f}s`\n\n"
-            f"**FINAL QUERY** &nbsp;`{result['query']}`"
-        )
-
-        return history, "", sources_md, debug_md
-
-    except Exception as e:
-        error_msg = f"❌ Error: {e}"
-        history = history + [
-            {"role": "user", "content": query},
-            {"role": "assistant", "content": error_msg},
-        ]
-        return history, "", "", traceback.format_exc()
-
+st.set_page_config(page_title="Self-Healing RAG", layout="centered")
 
 CUSTOM_CSS = """
+<style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
-:root {
-    --bg: #1A1E26;
-    --panel: #262B35;
-    --panel-border: #363D4A;
-    --teal: #4FD1C5;
-    --amber: #F2B84B;
-    --coral: #E8615B;
-    --text: #EDEFF3;
-    --text-muted: #8B92A3;
-}
-
-.gradio-container {
-    background: var(--bg) !important;
+html, body, [class*="css"] {
     font-family: 'IBM Plex Sans', sans-serif !important;
-    color: var(--text) !important;
-    max-width: 1100px !important;
-    width: 100% !important;
-    margin: 0 auto !important;
-}
-
-html, body, gradio-app, .app {
-    background: var(--bg) !important;
 }
 
 #console-header {
     display: flex; align-items: center; gap: 10px;
-    padding: 14px 18px; margin-bottom: 4px;
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
+    padding: 14px 18px; margin-bottom: 12px;
+    background: #F4F5F7;
+    border: 1px solid #E1E4E9;
     border-radius: 10px;
 }
 #console-header .status-dot {
     width: 8px; height: 8px; border-radius: 50%;
-    background: var(--teal);
-    box-shadow: 0 0 8px var(--teal);
-    animation: pulse 2.4s ease-in-out infinite;
-}
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
+    background: #1F9D8A;
 }
 #console-header .title {
     font-family: 'IBM Plex Mono', monospace;
     font-weight: 600; font-size: 14px; letter-spacing: 0.06em;
-    color: var(--text);
+    color: #000000 !important;
 }
 #console-header .subtitle {
     font-family: 'IBM Plex Mono', monospace;
-    font-size: 12px; color: var(--text-muted); margin-left: auto;
+    font-size: 12px; color: #000000 !important; margin-left: auto;
 }
 
-.gr-block, .gr-box, .block {
-    background: var(--panel) !important;
-    border-color: var(--panel-border) !important;
-    border-radius: 10px !important;
+/* Every diagnostic/status text block below forces black explicitly,
+   overriding any inherited theme color so nothing can go invisible
+   against a light or dark background. */
+.diag-text, .diag-text * {
+    color: #000000 !important;
+    font-size: 13px;
 }
-
-#upload-status {
+.diag-text code {
     font-family: 'IBM Plex Mono', monospace !important;
-    font-size: 12px !important;
-    color: var(--text-muted) !important;
-    padding: 4px 2px !important;
+    background: #EEF0F3 !important;
+    color: #000000 !important;
+    padding: 1px 5px; border-radius: 4px; font-size: 12px;
 }
-
-button.primary {
-    background: var(--teal) !important;
-    color: #0B1013 !important;
-    border: none !important;
-    font-weight: 600 !important;
-}
-button.primary:hover {
-    background: #6BE0D5 !important;
-}
-
-#chatbot {
-    border: 1px solid var(--panel-border) !important;
-    border-radius: 10px !important;
-}
-#chatbot .message.bot {
-    border-left: 2px solid var(--teal) !important;
-}
-
-#chatbot .message-row.user-row .message-bubble-border {
-    background: #2E5F58 !important;
-    border-radius: 12px 12px 2px 12px !important;
-    border: none !important;
-}
-#chatbot .message-row.bot-row .message-bubble-border {
-    background: #31394A !important;
-    border-radius: 12px 12px 12px 2px !important;
-    border: none !important;
-}
-
-textarea, input[type="text"] {
-    background: #151922 !important;
-    color: var(--text) !important;
-    border-color: var(--panel-border) !important;
-    font-family: 'IBM Plex Sans', sans-serif !important;
-}
-
-.label-wrap span, label span {
+.status-line, .status-line * {
     font-family: 'IBM Plex Mono', monospace !important;
-    font-size: 11px !important;
-    letter-spacing: 0.04em !important;
-    text-transform: uppercase !important;
-    color: var(--text-muted) !important;
-}
-
-#sources-panel, #debug-panel {
-    font-family: 'IBM Plex Sans', sans-serif !important;
     font-size: 13px !important;
+    color: #000000 !important;
 }
-#sources-panel code, #debug-panel code {
-    font-family: 'IBM Plex Mono', monospace !important;
-    background: #0F1319 !important;
-    color: var(--teal) !important;
-    padding: 1px 5px !important;
-    border-radius: 4px !important;
-    font-size: 12px !important;
-}
-#debug-panel strong {
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-size: 11px !important;
-    letter-spacing: 0.03em !important;
-    color: var(--text-muted) !important;
-}
-
-#sources-panel li, #debug-panel li {
-    color: var(--text) !important;
-}
-#sources-panel blockquote {
-    border-left: 2px solid var(--panel-border) !important;
-    padding-left: 10px !important;
-    color: var(--text-muted) !important;
-}
-#sources-panel strong, #debug-panel strong {
-    color: var(--teal) !important;
-}
-
-#intro-text p {
-    color: var(--text) !important;
-    font-size: 13px !important;
-    line-height: 1.6 !important;
-}
-
-#intro-text strong {
-    color: var(--teal) !important;
-    font-weight: 600 !important;
-}
+</style>
 """
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 HEADER_HTML = """
 <div id="console-header">
     <span class="status-dot"></span>
     <span class="title">SELF-HEALING RAG</span>
-    <span class="subtitle">hybrid search &nbsp;·&nbsp; cross-encoder rerank &nbsp;·&nbsp; critic-agent retry loop</span>
+    <span class="subtitle">hybrid search &middot; cross-encoder rerank &middot; critic-agent retry loop</span>
 </div>
 """
+st.markdown(HEADER_HTML, unsafe_allow_html=True)
 
-with gr.Blocks(title="Self-Healing RAG") as demo:
-    gr.HTML(HEADER_HTML)
+st.markdown(
+    "<div class='diag-text'>Upload a PDF, then ask questions. Unlike plain RAG, this pipeline "
+    "runs a <b>critic agent</b> that checks whether the answer is actually "
+    "grounded in the retrieved chunks — if not, it <b>reformulates the "
+    "query and retries</b> (up to 2x) before ever admitting it doesn't know. "
+    "Expand <b>Diagnostics</b> below each answer to watch this happen live.</div>",
+    unsafe_allow_html=True,
+)
+st.write("")
 
-    gr.Markdown(
-        "Upload a PDF, then ask questions. Unlike plain RAG, this pipeline "
-        "runs a **critic agent** that checks whether the answer is actually "
-        "grounded in the retrieved chunks — if not, it **reformulates the "
-        "query and retries** (up to 2x) before ever admitting it doesn't know. "
-        "Expand **Diagnostics** below each answer to watch this happen live.",
-        elem_id="intro-text",
-    )
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+if "last_elapsed" not in st.session_state:
+    st.session_state.last_elapsed = 0.0
 
-    with gr.Row():
-        pdf_input = gr.File(label="Upload PDF", file_types=[".pdf"])
-        upload_btn = gr.Button("Ingest", variant="primary", scale=0)
-    upload_status = gr.HTML(elem_id="upload-status")
+# --- Upload section ---
+col1, col2 = st.columns([3, 1])
+with col1:
+    pdf_file = st.file_uploader("Upload PDF", type=["pdf"], label_visibility="collapsed")
+with col2:
+    ingest_clicked = st.button("Ingest", type="primary", use_container_width=True)
 
-    upload_btn.click(handle_upload, inputs=pdf_input, outputs=upload_status)
+status_placeholder = st.empty()
 
-    chatbot = gr.Chatbot(label="Chat", elem_id="chatbot", height=380)
-    query_input = gr.Textbox(
-        label="Question", placeholder="What does this document say about...?"
-    )
-    ask_btn = gr.Button("Ask", variant="primary")
+if ingest_clicked:
+    if pdf_file is None:
+        status_placeholder.markdown(
+            "<span class='status-line'>NO FILE — select a PDF before ingesting</span>",
+            unsafe_allow_html=True,
+        )
+    else:
+        status_placeholder.markdown(
+            "<span class='status-line'>Processing... ingesting document</span>",
+            unsafe_allow_html=True,
+        )
+        try:
+            tmp_path = Path(tempfile.gettempdir()) / pdf_file.name
+            tmp_path.write_bytes(pdf_file.getvalue())
+            start = time.time()
+            collection = ingest_pdf(str(tmp_path), collection_name=COLLECTION_NAME)
+            invalidate_bm25_cache(COLLECTION_NAME)
+            elapsed = time.time() - start
+            status_placeholder.markdown(
+                f"<span class='status-line'>INGESTED in {elapsed:.1f}s &middot; "
+                f"{collection.count()} chunks indexed &middot; ready for questions</span>",
+                unsafe_allow_html=True,
+            )
+        except Exception as e:
+            status_placeholder.markdown(
+                f"<span class='status-line'>INGEST FAILED — {e}</span>",
+                unsafe_allow_html=True,
+            )
 
-    with gr.Accordion("Sources used", open=False):
-        sources_panel = gr.Markdown(elem_id="sources-panel")
+st.markdown("---")
 
-    with gr.Accordion("Diagnostics", open=False):
-        debug_panel = gr.Markdown(elem_id="debug-panel")
+# --- Chat history ---
+for msg in st.session_state.history:
+    with st.chat_message(msg["role"]):
+        st.markdown(f"<div class='diag-text'>{msg['content']}</div>", unsafe_allow_html=True)
 
-    ask_btn.click(
-        handle_question,
-        inputs=[query_input, chatbot],
-        outputs=[chatbot, query_input, sources_panel, debug_panel],
-    )
-    query_input.submit(
-        handle_question,
-        inputs=[query_input, chatbot],
-        outputs=[chatbot, query_input, sources_panel, debug_panel],
-    )
+query = st.chat_input("What does this document say about...?")
 
-if __name__ == "__main__":
-    demo.launch(
-        theme=gr.themes.Base(),
-        css=CUSTOM_CSS,
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 7860)),
-    )
+if query:
+    st.session_state.history.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.markdown(f"<div class='diag-text'>{query}</div>", unsafe_allow_html=True)
+
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        placeholder.markdown(
+            "<span class='status-line'>Processing... running self-healing retrieval</span>",
+            unsafe_allow_html=True,
+        )
+        try:
+            start = time.time()
+            result = ask(query, collection_name=COLLECTION_NAME)
+            elapsed = time.time() - start
+            answer = result["final_output"]
+            placeholder.markdown(f"<div class='diag-text'>{answer}</div>", unsafe_allow_html=True)
+            st.session_state.history.append({"role": "assistant", "content": answer})
+            st.session_state.last_result = result
+            st.session_state.last_elapsed = elapsed
+        except Exception as e:
+            error_msg = f"Error: {e}"
+            placeholder.markdown(f"<div class='diag-text'>{error_msg}</div>", unsafe_allow_html=True)
+            st.session_state.history.append({"role": "assistant", "content": error_msg})
+            st.session_state.last_result = None
+
+# --- Sources & Diagnostics for the most recent answer ---
+if st.session_state.last_result:
+    result = st.session_state.last_result
+    elapsed = st.session_state.last_elapsed
+
+    with st.expander("Sources used"):
+        if not result["chunks"]:
+            st.markdown("<div class='diag-text'><i>no chunks retrieved</i></div>", unsafe_allow_html=True)
+        for i, c in enumerate(result["chunks"], start=1):
+            snippet = c["text"][:250] + ("..." if len(c["text"]) > 250 else "")
+            st.markdown(
+                f"<div class='diag-text'><b>[{i}]</b> <code>{c['source']}</code> "
+                f"page {c['page']} &middot; rerank score <code>{c['rerank_score']:.3f}</code>"
+                f"<br><i>{snippet}</i></div><br>",
+                unsafe_allow_html=True,
+            )
+
+    with st.expander("Diagnostics"):
+        conf = result["confidence"]
+        dot_color = CONFIDENCE_DOT_COLOR.get(conf["label"], "#9AA0AC")
+        retry_dots = "".join(
+            f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;'
+            f'background:{"#C9861A" if i < result["retry_count"] else "#D8DBE0"};margin-right:4px;"></span>'
+            for i in range(2)
+        )
+        sub_queries_html = "<br>".join(f"&nbsp;&nbsp;- {sq}" for sq in result["sub_queries"])
+
+        st.markdown(
+            f"""<div class='diag-text'>
+            <span style="display:inline-block;width:9px;height:9px;border-radius:50%;
+            background:{dot_color};margin-right:6px;"></span>
+            <b>CONFIDENCE</b> <code>{conf['label'].upper()}</code>
+            &middot; best rerank score <code>{conf['best_rerank_score']}</code><br><br>
+            <b>VERDICT</b> <code>{(result['verdict'] or '—').upper()}</code><br><br>
+            <b>RETRIES</b> {retry_dots} {result['retry_count']} / 2<br><br>
+            <b>CRITIC NOTE</b> {result['critique_reason'] or '—'}<br><br>
+            <b>LATENCY</b> <code>{elapsed:.2f}s</code><br><br>
+            <b>SUB-QUERIES</b><br>{sub_queries_html}<br><br>
+            <b>FINAL QUERY</b> <code>{result['query']}</code>
+            </div>""",
+            unsafe_allow_html=True,
+        )
