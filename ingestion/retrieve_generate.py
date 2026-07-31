@@ -12,6 +12,25 @@ from llm_client import chat_completion
 
 load_dotenv()
 
+
+#---------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------
+
+import json
+
+def get_all_summaries(collection_name: str = "documents") -> dict:
+    """Returns {source_name: summary} for every document currently in this collection."""
+    path = Path(__file__).parent.parent / "data" / "summaries.json"
+    if not path.exists():
+        return {}
+    all_summaries = json.loads(path.read_text())
+    collection = get_collection(collection_name)
+    sources_here = {m["source"] for m in collection.get(include=["metadatas"])["metadatas"]}
+    return {k: v for k, v in all_summaries.items() if k in sources_here}
+
+#---------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------
+
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 CHROMA_PERSIST_DIR = str(Path(__file__).parent.parent / "data" / "chroma_store")
@@ -151,7 +170,7 @@ def _reciprocal_rank_fusion(vector_results: list[dict], bm25_results: list[dict]
     return [chunk_lookup[cid] for cid in fused_ids]
 
 
-def retrieve(query: str, collection_name: str = "documents", top_k: int = 4,
+def retrieve(query: str, collection_name: str = "documents", top_k: int = 6,
              rerank_threshold: float = RERANK_THRESHOLD) -> list[dict]:
     """
     Hybrid retrieval: runs vector search AND BM25 keyword search in
@@ -212,14 +231,11 @@ def compute_confidence(chunks: list[dict]) -> dict:
 
     return {"label": label, "score": round(best_score, 3), "best_rerank_score": round(best_score, 3)}
 
-
 def build_context_block(chunks: list[dict]) -> str:
-    """Formats chunks with [1], [2]... markers so the LLM can cite them."""
     lines = []
     for i, c in enumerate(chunks, start=1):
-        lines.append(f"[{i}] (source: {c['source']}, page {c['page']})\n{c['text']}")
+        lines.append(f"[[Source {i}]] (source: {c['source']}, page {c['page']})\n{c['text']}")
     return "\n\n".join(lines)
-
 
 def generate_answer(query: str, chunks: list[dict]) -> str:
     """
@@ -232,7 +248,25 @@ def generate_answer(query: str, chunks: list[dict]) -> str:
     system_prompt = (
         "You are a precise research assistant. Answer the user's question "
         "using ONLY the numbered context chunks below. "
-        "Cite every claim with its chunk number like [1] or [2]. "
+        "Cite every claim using the exact marker format [[Source N]], e.g. "
+        "[[Source 1]] or [[Source 2]] — this refers to the numbered sources "
+        "below, NOT any citation numbers that may appear inside the source "
+        "text itself (some documents contain their own bracket-style "
+        "references like [7], which are part of that document's content, "
+        "not a valid source marker for you to cite). "
+        "If a question asks for multiple facts, treat each fact separately: "
+        "find the specific chunk that actually contains that exact fact, and "
+        "cite only that chunk for it. Do not cite a chunk for a fact it does "
+        "not contain, even if that chunk covers the same general topic or "
+        "was cited for a different fact in your answer. If different facts "
+        "come from different chunks, use a different citation number for each. "
+        "Some chunks contain dense comparison tables with multiple rows "
+        "squeezed together. If a chunk's table formatting makes it ambiguous "
+        "which specific row a number belongs to (for example, several models' "
+        "names and numbers appear close together with unclear boundaries), do "
+        "NOT guess the attribution. Either state that the exact figure is "
+        "ambiguous in the source, or omit that specific fact rather than risk "
+        "misattributing it to the wrong entity. "
         "If the context does not contain enough information to answer, "
         "say exactly: 'The provided context does not contain enough "
         "information to answer this question.' Do not use outside knowledge."
