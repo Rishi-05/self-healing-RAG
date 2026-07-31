@@ -1,3 +1,4 @@
+import re
 import sys
 import time
 from pathlib import Path
@@ -20,7 +21,7 @@ CONFIDENCE_DOT_COLOR = {
     "none": "#9AA0AC",
 }
 
-st.set_page_config(page_title="Self-Healing RAG", layout="centered")
+st.set_page_config(page_title="Self-Healing RAG", layout="wide")
 
 CUSTOM_CSS = """
 <style>
@@ -51,9 +52,6 @@ html, body, [class*="css"] {
     font-size: 12px; color: #000000 !important; margin-left: auto;
 }
 
-/* Every diagnostic/status text block below forces black explicitly,
-   overriding any inherited theme color so nothing can go invisible
-   against a light or dark background. */
 .diag-text, .diag-text * {
     color: #000000 !important;
     font-size: 13px;
@@ -68,6 +66,50 @@ html, body, [class*="css"] {
     font-family: 'IBM Plex Mono', monospace !important;
     font-size: 13px !important;
     color: #000000 !important;
+}
+
+/* --- Chat layout --- */
+.sidebar-title {
+    font-family: 'IBM Plex Mono', monospace; font-weight: 700; font-size: 15px;
+    letter-spacing: .04em; color: #000000; margin-bottom: 18px;
+}
+.msg-row { display: flex; margin-bottom: 14px; }
+.msg-row.user { justify-content: flex-end; }
+.msg-row.assistant { justify-content: flex-start; align-items: flex-start; gap: 8px; }
+.avatar {
+    width: 26px; height: 26px; border-radius: 50%;
+    background: #1F9D8A; color: #ffffff; display: flex;
+    align-items: center; justify-content: center;
+    font-size: 11px; font-family: 'IBM Plex Mono', monospace;
+    flex-shrink: 0; margin-top: 2px;
+}
+.bubble {
+    max-width: 78%; padding: 10px 14px; border-radius: 14px;
+    font-size: 13.5px; line-height: 1.55;
+}
+.bubble.user, .bubble.user * {
+    background: #1F9D8A; color: #ffffff !important;
+    border-bottom-right-radius: 4px;
+}
+.bubble.assistant {
+    background: #F4F5F7; border: 1px solid #E1E4E9; color: #000000;
+    border-bottom-left-radius: 4px;
+}
+.citation-badges { margin-top: 8px; }
+.citation-chip {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 19px; height: 19px; border-radius: 50%;
+    background: #DFF3EF; color: #1F9D8A; font-size: 10px; font-weight: 700;
+    margin-right: 5px;
+}
+.citations-panel-title {
+    font-family: 'IBM Plex Mono', monospace; font-weight: 600;
+    font-size: 12px; letter-spacing: .04em; color: #000000; margin-bottom: 10px;
+}
+.citation-card { border-bottom: 1px solid #E1E4E9; padding: 10px 0; }
+.citation-card .src-name { font-weight: 600; font-size: 12.5px; color: #000000; }
+.citation-card .snippet {
+    font-size: 11.5px; color: #4B4F58; font-style: italic; margin-top: 4px;
 }
 </style>
 """
@@ -87,7 +129,8 @@ st.markdown(
     "runs a <b>critic agent</b> that checks whether the answer is actually "
     "grounded in the retrieved chunks — if not, it <b>reformulates the "
     "query and retries</b> (up to 2x) before ever admitting it doesn't know. "
-    "Expand <b>Diagnostics</b> below each answer to watch this happen live.</div>",
+    "Citations under each answer link to the panel on the right; expand "
+    "<b>Diagnostics</b> below to watch the self-healing loop live.</div>",
     unsafe_allow_html=True,
 )
 st.write("")
@@ -98,6 +141,12 @@ if "last_result" not in st.session_state:
     st.session_state.last_result = None
 if "last_elapsed" not in st.session_state:
     st.session_state.last_elapsed = 0.0
+
+
+def extract_citation_numbers(text: str) -> list:
+    """Pulls unique [n] citation markers out of generated answer text, in order."""
+    return sorted({int(n) for n in re.findall(r"\[(\d+)\]", text)})
+
 
 # --- Upload section ---
 col1, col2 = st.columns([3, 1])
@@ -139,55 +188,94 @@ if ingest_clicked:
 
 st.markdown("---")
 
-# --- Chat history ---
-for msg in st.session_state.history:
-    with st.chat_message(msg["role"]):
-        st.markdown(f"<div class='diag-text'>{msg['content']}</div>", unsafe_allow_html=True)
+# --- Three-pane chat layout: sidebar / chat / active citations ---
+left_col, main_col, right_col = st.columns([1, 3, 1.3], gap="large")
+
+with left_col:
+    st.markdown('<div class="sidebar-title">Self-Healing RAG</div>', unsafe_allow_html=True)
+    if st.button("+ New Chat", use_container_width=True):
+        st.session_state.history = []
+        st.session_state.last_result = None
+        st.rerun()
+
+with main_col:
+    for idx, msg in enumerate(st.session_state.history):
+        if msg["role"] == "user":
+            st.markdown(
+                f'<div class="msg-row user"><div class="bubble user">{msg["content"]}</div></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            cite_nums = msg.get("citation_numbers", [])
+            badges = "".join(f'<span class="citation-chip">{n}</span>' for n in cite_nums)
+            badges_html = f'<div class="citation-badges">{badges}</div>' if badges else ""
+            st.markdown(
+                f'<div class="msg-row assistant"><div class="avatar">AI</div>'
+                f'<div class="bubble assistant">{msg["content"]}{badges_html}</div></div>',
+                unsafe_allow_html=True,
+            )
+            fcol1, fcol2, _ = st.columns([0.07, 0.07, 0.86])
+            with fcol1:
+                if st.button("👍", key=f"up_{idx}"):
+                    msg["feedback"] = "up"
+                    st.rerun()
+            with fcol2:
+                if st.button("👎", key=f"down_{idx}"):
+                    msg["feedback"] = "down"
+                    st.rerun()
+
+with right_col:
+    st.markdown('<div class="citations-panel-title">ACTIVE CITATIONS</div>', unsafe_allow_html=True)
+    last_result = st.session_state.last_result
+    if not last_result or not last_result["chunks"]:
+        st.markdown(
+            "<div class='diag-text'><i>Ask a question to see citations here.</i></div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        last_assistant = next(
+            (m for m in reversed(st.session_state.history) if m["role"] == "assistant"), None
+        )
+        cited = last_assistant.get("citation_numbers", []) if last_assistant else []
+        chunks_to_show = (
+            [last_result["chunks"][n - 1] for n in cited if 0 < n <= len(last_result["chunks"])]
+            if cited else last_result["chunks"]
+        )
+        for c in chunks_to_show:
+            snippet = c["text"][:160] + ("..." if len(c["text"]) > 160 else "")
+            st.markdown(
+                f'<div class="citation-card"><div class="src-name">{c["source"]}</div>'
+                f'<div class="snippet">"{snippet}"</div></div>',
+                unsafe_allow_html=True,
+            )
 
 query = st.chat_input("What does this document say about...?")
 
 if query:
     st.session_state.history.append({"role": "user", "content": query})
-    with st.chat_message("user"):
-        st.markdown(f"<div class='diag-text'>{query}</div>", unsafe_allow_html=True)
-
-    with st.chat_message("assistant"):
-        placeholder = st.empty()
-        placeholder.markdown(
-            "<span class='status-line'>Processing... running self-healing retrieval</span>",
-            unsafe_allow_html=True,
+    try:
+        start = time.time()
+        result = ask(query, collection_name=COLLECTION_NAME)
+        elapsed = time.time() - start
+        answer = result["final_output"]
+        cite_nums = extract_citation_numbers(answer)
+        st.session_state.history.append(
+            {"role": "assistant", "content": answer, "citation_numbers": cite_nums}
         )
-        try:
-            start = time.time()
-            result = ask(query, collection_name=COLLECTION_NAME)
-            elapsed = time.time() - start
-            answer = result["final_output"]
-            placeholder.markdown(f"<div class='diag-text'>{answer}</div>", unsafe_allow_html=True)
-            st.session_state.history.append({"role": "assistant", "content": answer})
-            st.session_state.last_result = result
-            st.session_state.last_elapsed = elapsed
-        except Exception as e:
-            error_msg = f"Error: {e}"
-            placeholder.markdown(f"<div class='diag-text'>{error_msg}</div>", unsafe_allow_html=True)
-            st.session_state.history.append({"role": "assistant", "content": error_msg})
-            st.session_state.last_result = None
+        st.session_state.last_result = result
+        st.session_state.last_elapsed = elapsed
+    except Exception as e:
+        error_msg = f"Error: {e}"
+        st.session_state.history.append(
+            {"role": "assistant", "content": error_msg, "citation_numbers": []}
+        )
+        st.session_state.last_result = None
+    st.rerun()
 
-# --- Sources & Diagnostics for the most recent answer ---
+# --- Diagnostics for the most recent answer ---
 if st.session_state.last_result:
     result = st.session_state.last_result
     elapsed = st.session_state.last_elapsed
-
-    with st.expander("Sources used"):
-        if not result["chunks"]:
-            st.markdown("<div class='diag-text'><i>no chunks retrieved</i></div>", unsafe_allow_html=True)
-        for i, c in enumerate(result["chunks"], start=1):
-            snippet = c["text"][:250] + ("..." if len(c["text"]) > 250 else "")
-            st.markdown(
-                f"<div class='diag-text'><b>[{i}]</b> <code>{c['source']}</code> "
-                f"page {c['page']} &middot; rerank score <code>{c['rerank_score']:.3f}</code>"
-                f"<br><i>{snippet}</i></div><br>",
-                unsafe_allow_html=True,
-            )
 
     with st.expander("Diagnostics"):
         conf = result["confidence"]
