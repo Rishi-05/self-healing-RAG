@@ -14,6 +14,54 @@ CHUNK_SIZE = 800          # characters per chunk
 CHUNK_OVERLAP = 150       # overlap so context isn't cut mid-idea
 
 
+#---------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------
+import json
+from groq import Groq
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SUMMARY_STORE_PATH = str(Path(__file__).parent.parent / "data" / "summaries.json")
+_groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+
+def _load_summaries() -> dict:
+    path = Path(SUMMARY_STORE_PATH)
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _save_summaries(summaries: dict):
+    path = Path(SUMMARY_STORE_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(summaries, indent=2))
+
+
+def generate_document_summary(chunks: list[dict], source_name: str) -> str:
+    """Samples chunks spread across the whole document (not just the top few)
+    so the summary reflects breadth, not just whatever ranks highest."""
+    sample_size = min(len(chunks), 12)
+    step = max(1, len(chunks) // sample_size)
+    sampled = chunks[::step][:sample_size]
+    sample_text = "\n\n".join(c["text"] for c in sampled)
+
+    response = _groq_client.chat.completions.create(
+        model="openai/gpt-oss-120b",
+        messages=[
+            {"role": "system", "content": (
+                "Summarize what this document is about in 3-5 sentences, based "
+                "on the excerpts below. Be general and factual; do not invent "
+                "details the excerpts don't support."
+            )},
+            {"role": "user", "content": sample_text},
+        ],
+        temperature=0.2,
+    )
+    return response.choices[0].message.content.strip()
+
+#---------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------
+
 def extract_text_from_pdf(pdf_path: str) -> list[dict]:
     """
     Returns a list of {page_number, text} dicts — one per PDF page.
@@ -97,7 +145,12 @@ def ingest_pdf(pdf_path: str, collection_name: str = "documents", force: bool = 
         metadatas=[c["metadata"] for c in chunks],
     )
     print(f"      -> Done. Collection now has {collection.count()} total chunks.")
-
+    print(f"[4/4] Generating document summary ...")
+    summary = generate_document_summary(chunks, source_name)
+    summaries = _load_summaries()
+    summaries[source_name] = summary
+    _save_summaries(summaries)
+    print("      -> Summary cached.")
     return collection
 
 
