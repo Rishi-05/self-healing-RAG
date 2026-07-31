@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import TypedDict
 
 from dotenv import load_dotenv
+from langgraph import graph
 from langgraph.graph import StateGraph, END
 
 sys.path.append(str(Path(__file__).parent.parent / "ingestion"))
@@ -32,6 +33,60 @@ class RAGState(TypedDict):
     confidence: dict
     final_output: str
 
+
+#---------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------
+
+from retrieve_generate import retrieve, generate_answer, build_context_block, get_all_summaries  # noqa: E402
+
+META_QUERY_PHRASES = (
+    "what is this document about",
+    "what's this document about",
+    "tell me about this document",
+    "tell me about this pdf",
+    "summarize this document",
+    "summarize this pdf",
+    "give me an overview",
+    "what is this pdf about",
+    "what does this document cover",
+)
+
+
+def is_meta_query(query: str) -> bool:
+    q = query.lower().strip()
+    return any(phrase in q for phrase in META_QUERY_PHRASES)
+
+
+def check_meta_node(state: RAGState) -> RAGState:
+    return state  # pass-through, exists purely as a routing point
+
+
+def summary_node(state: RAGState) -> RAGState:
+    summaries = get_all_summaries(state["collection_name"])
+    if not summaries:
+        state["final_output"] = "No documents have been ingested into this collection yet."
+    elif len(summaries) == 1:
+        state["final_output"] = next(iter(summaries.values()))
+    else:
+        state["final_output"] = "\n\n".join(f"{src}: {summ}" for src, summ in summaries.items())
+
+    state["chunks"] = []
+    state["sub_queries"] = []
+    state["query"] = state["original_query"]
+    state["verdict"] = "summary"
+    state["confidence"] = {"label": "n/a", "score": None, "best_rerank_score": None}
+    state["critique_reason"] = (
+        "Answered from a summary generated at ingestion time; the retrieval "
+        "and critic loop is skipped for whole-document questions."
+    )
+    return state
+
+
+def route_entry(state: RAGState) -> str:
+    return "summary" if is_meta_query(state["original_query"]) else "decompose"
+
+#---------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------
 # Nodes
@@ -81,11 +136,11 @@ def retrieve_node(state: RAGState) -> RAGState:
     queries_to_run = state["sub_queries"] if state["retry_count"] == 0 else [state["query"]]
     merged: dict = {}
     for q in queries_to_run:
-        for chunk in retrieve(q, state["collection_name"], top_k=4):
+        for chunk in retrieve(q, state["collection_name"], top_k=6):
             key = (chunk["source"], chunk["page"], chunk["text"])
             if key not in merged or chunk["rerank_score"] > merged[key]["rerank_score"]:
                 merged[key] = chunk
-    chunks = sorted(merged.values(), key=lambda c: c["rerank_score"], reverse=True)[:6]
+    chunks = sorted(merged.values(), key=lambda c: c["rerank_score"], reverse=True)[:8]
     state["chunks"] = chunks
     state["confidence"] = compute_confidence(chunks)
     return state
@@ -144,6 +199,16 @@ def critique_node(state: RAGState) -> RAGState:
         "asked for is not literally present in the chunks, mark "
         "'not_grounded' even if the chunks are topically relevant and the "
         "answer sounds plausible.\n"
+        "4. PARAPHRASE IS ACCEPTABLE: a fact counts as present if the same "
+        "underlying number, name, or specific value appears in the source, "
+        "even if the surrounding wording is paraphrased or rephrased (for "
+        "example, a chunk saying 'X percent when grouped by event' DOES "
+        "support an answer describing that as 'event-based accuracy of X "
+        "percent' — this is a faithful paraphrase, not a fabrication). Only "
+        "mark 'not_grounded' for a specific fact if the exact number, name, "
+        "or value itself is absent, different, or contradicted by the "
+        "source — not merely because the wording differs from the source's "
+        "phrasing."
         "Mark 'not_grounded' if ANY of the three checks fail. "
         "Respond ONLY with valid JSON in this exact format: "
         '{"verdict": "grounded" or "not_grounded", "reason": "<one sentence>"}'
@@ -253,7 +318,10 @@ def route_after_critique(state: RAGState) -> str:
 # ---------------------------------------------------------------------
 def build_graph():
     graph = StateGraph(RAGState)
-
+    
+    graph.add_node("check_meta", check_meta_node)
+    graph.add_node("summary", summary_node)
+    
     graph.add_node("decompose", decompose_node)
 
     graph.add_node("retrieve", retrieve_node)
@@ -263,9 +331,17 @@ def build_graph():
     graph.add_node("finalize_grounded", finalize_grounded_node)
     graph.add_node("finalize_fallback", finalize_fallback_node)
 
-    graph.set_entry_point("decompose")
+    graph.set_entry_point("check_meta")
+    graph.add_conditional_edges(
+        "check_meta", 
+        route_entry, 
+        {
+            "summary": "summary", 
+            "decompose": "decompose",
+        },
+    )
     graph.add_edge("decompose", "retrieve")
-    graph.add_edge("retrieve", "generate")  
+    graph.add_edge("retrieve", "generate")
 
     graph.add_conditional_edges(
         "generate",
@@ -290,6 +366,7 @@ def build_graph():
     graph.add_edge("reformulate", "retrieve")   # the self-healing loop
     graph.add_edge("finalize_grounded", END)
     graph.add_edge("finalize_fallback", END)
+    graph.add_edge("summary", END)
 
     return graph.compile()
 
