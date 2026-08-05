@@ -3,19 +3,21 @@ pdfplumber==0.11.0
 sentence-transformers==2.5.1
 rank-bm25==0.2.2
 chromadb==0.4.24
+
+# FIXED COMPATIBILITY
 langchain-text-splitters==0.0.1
+langchain-core==0.1.48
+
+# FIXED VERSION (valid one)
+langgraph==0.1.19
+
 groq==0.9.0
-langgraph==0.1.0
-langchain-core==0.2.0
 python-dotenv==1.0.1
 pydantic==2.7.1
 
-# critical hidden deps
+# stability deps
 starlette==0.27.0
 fastapi==0.103.0
 uvicorn==0.23.2
 httpx==0.24.1
-
-# prevent build failures
 numpy==1.26.4
-
