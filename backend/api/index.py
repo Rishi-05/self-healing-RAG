@@ -1,29 +1,23 @@
 import os
-from flask import Flask, request, jsonify, session, Response
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-from flask_session import Session
 from dotenv import load_dotenv
 from groq import Groq
-import uuid
 import logging
 from elevenlabs import ElevenLabs,VoiceSettings
 
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
+CORS(app, resources={r"/api/*": {"origins": [
+    "https://rishi-chilveri.vercel.app",
+    "http://localhost:3000",
+]}})
 logging.basicConfig(level=logging.DEBUG)
 
-app.config['SECRET_KEY'] = os.urandom(24)
-app.config['SESSION_TYPE'] = 'filesystem'
-app.config['SESSION_FILE_DIR'] = './flask_session/'
-app.config['SESSION_PERMANENT'] = False
-app.config['SESSION_USE_SIGNER'] = True
-Session(app)
-
 load_dotenv()
-os.environ['GROQ_API_KEY'] = os.getenv("GROQ_API_KEY")
+groq_api_key = os.getenv("GROQ_API_KEY")
 elevenLabs_API_KEY = os.getenv("elevenLabs_API_KEY")
 
-groq_client = Groq()
+groq_client = Groq(api_key=groq_api_key)
 elevenlabs_client = ElevenLabs(
     api_key=elevenLabs_API_KEY,
 )
@@ -74,7 +68,7 @@ def chat_with_llama(user_question, chat_history, resume_content):
         )
 
         # Extract the assistant's response
-        assistant_response = response.choices[0].message["content"]
+        assistant_response = response.choices[0].message.content
         return assistant_response
 
     except Exception as e:
@@ -133,19 +127,4 @@ def text_to_speech():
 
     except Exception as e:
         print(f"An error occurred: {str(e)}")
-
-
-@app.route('/api/start_session', methods=['POST'])
-
-def start_session():
-    # Generate a unique session ID
-    session_id = str(uuid.uuid4())
-    session['session_id'] = session_id
-
-    return jsonify({"session_id": session_id, "message": "New session started"})
-
-
-@app.route('/api/end_session', methods=['POST'])
-def end_session():
-    session.clear()
-    return jsonify({"message": "Session ended"})
+        return jsonify({"error": str(e)}), 500
