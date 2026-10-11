@@ -39,23 +39,40 @@ class RAGState(TypedDict):
 
 from retrieve_generate import retrieve, generate_answer, build_context_block, get_all_summaries  # noqa: E402
 
-META_QUERY_PHRASES = (
-    "what is this document about",
-    "what's this document about",
-    "tell me about this document",
-    "tell me about this pdf",
-    "summarize this document",
-    "summarize this pdf",
-    "give me an overview",
-    "what is this pdf about",
-    "what does this document cover",
-)
+DOC = r"(?:doc|docs|document|documents|pdf|pdfs|file|files|paper|papers|report|resume|resumé|cv|upload(?:ed)?|attachment|text|content|material|notes)"
+THIS = r"(?:this|the|my|that|these|those|uploaded|attached|current|above)"
+
+META_QUERY_PATTERNS = [re.compile(p) for p in (
+    # summarize / summarise / summary / sum up / recap / tldr
+    rf"\bsummar(?:i[sz]e|y|ies|i[sz]ing)\b.*\b{DOC}\b",
+    rf"\b{DOC}\b.*\bsummar(?:i[sz]e|y|ies)\b",
+    r"^\s*(?:please\s+)?(?:give|show|write|provide|create|make|get)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+)?(?:quick\s+|short\s+|brief\s+|detailed\s+|full\s+)?(?:summary|overview|synopsis|recap|abstract|gist)\b",
+    r"^\s*(?:please\s+)?summar(?:i[sz]e|y)\s*(?:it|this|that|please|pls)?\s*[.!?]*\s*$",
+    r"\b(?:sum\s+(?:it|this|that)\s+up|sum\s+up\b|in\s+a\s+nutshell|key\s+(?:points|takeaways|highlights)|main\s+(?:points|ideas|takeaways)|tl;?\s?dr|tldr|gist\s+of|short\s+version|quick\s+version)",
+    # explain / describe / walk through
+    rf"\b(?:explain|describe|break\s*down|walk\s+me\s+through|go\s+through|go\s+over|run\s+through|analy[sz]e|review|interpret)\b.*\b{THIS}?\s*{DOC}\b",
+    r"^\s*(?:please\s+)?explain\s*(?:it|this|that|everything)?\s*(?:to\s+me)?\s*(?:please|pls)?\s*[.!?]*\s*$",
+    # what is it about
+    rf"\bwhat(?:'s|\s+is|\s+does)\b.*\b{DOC}\b.*\b(?:about|say|contain|cover|discuss|mean)\b",
+    rf"\bwhat(?:'s|\s+is)\s+in\s+{THIS}\s+{DOC}\b",
+    r"^\s*what(?:'s|\s+is)\s+(?:this|it)\s+about\s*\??\s*$",
+    rf"\b(?:tell|teach|brief|fill)\s+me\s+(?:about|on|in\s+on)\s+{THIS}\s+{DOC}\b",
+    rf"\b(?:overview|synopsis|outline|gist|abstract)\s+of\s+{THIS}\s+{DOC}\b",
+    rf"\b(?:main|central|core|key)\s+(?:topic|idea|theme|point|purpose|subject)s?\s+of\s+{THIS}\s+{DOC}\b",
+    rf"\bwhat\s+(?:topics|is\s+the\s+topic|is\s+the\s+purpose|is\s+the\s+main\s+idea|is\s+the\s+subject|are\s+the\s+main\s+points)\b",
+    rf"\bwhat\s+(?:did\s+i|have\s+i)\s+(?:just\s+)?upload(?:ed)?\b",
+    rf"\b(?:help\s+me\s+)?(?:understand|make\s+sense\s+of)\s+{THIS}\s+{DOC}\b",
+    rf"\b(?:what\s+should\s+i\s+know|what\s+do\s+i\s+need\s+to\s+know)\s+(?:about|from)\s+{THIS}\s+{DOC}\b",
+    rf"\bi\s+(?:don'?t|do\s+not)\s+understand\s+{THIS}\s+{DOC}\b",
+    rf"\b(?:read|look\s+at|check)\s+{THIS}\s+{DOC}\b.*\b(?:tell|explain|summar)",
+    rf"\bwhat\s+is\s+{THIS}\s+{DOC}\s*\??\s*$",
+    rf"\bwhat\s+kind\s+of\s+{DOC}\s+is\s+(?:this|it)\b",
+)]
 
 
 def is_meta_query(query: str) -> bool:
-    q = query.lower().strip()
-    return any(phrase in q for phrase in META_QUERY_PHRASES)
-
+    q = " ".join(query.lower().strip().split())
+    return any(p.search(q) for p in META_QUERY_PATTERNS)
 
 def check_meta_node(state: RAGState) -> RAGState:
     return state  # pass-through, exists purely as a routing point
