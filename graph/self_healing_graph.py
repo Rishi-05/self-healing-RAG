@@ -1,92 +1,126 @@
 import json
 import re
-import os
 import sys
 from pathlib import Path
-from typing import TypedDict
+from typing import Optional, TypedDict
 
 from dotenv import load_dotenv
-from langgraph import graph
 from langgraph.graph import StateGraph, END
 
 sys.path.append(str(Path(__file__).parent.parent / "ingestion"))
 from retrieve_generate import retrieve, generate_answer, build_context_block, compute_confidence  # noqa: E402
+from summaries import get_summaries  # noqa: E402
 from llm_client import chat_completion  # noqa: E402
 
 load_dotenv()
-
 MAX_RETRIES = 2
-
+WHOLE_DOC_MARKER = "__WHOLE_DOCUMENT__"
 
 # ---------------------------------------------------------------------
 # Graph state — this dict is passed between every node
 # ---------------------------------------------------------------------
 class RAGState(TypedDict):
     original_query: str
-    query: str                
+    query: str
     sub_queries: list           # decomposed sub-questions for compound queries
     collection_name: str
+    source: Optional[str]       # restrict to ONE document ("this pdf"); None = all documents
     chunks: list
     answer: str
-    verdict: str                # "grounded" | "not_grounded"
+    verdict: str                # "grounded" | "not_grounded" | "summary"
     critique_reason: str
     retry_count: int
     confidence: dict
     final_output: str
 
 
-#---------------------------------------------------------------------------------------------
-#---------------------------------------------------------------------------------------------
+_DOC = (r"(?:doc|docs|document|documents|pdf|pdfs|file|files|paper|papers|report|resume|cv|"
+        r"article|thesis|book|manual|upload|uploads|uploaded file|attachment|text|notes)")
+_THIS = r"(?:this|the|my|that|these|those|uploaded|attached|current)"
+_THIS_DOC = rf"{_THIS}(?: (?:{_THIS}|whole|entire|full|complete))? {_DOC}"
+_TAIL = (r"(?: (?:in|into|as|using|with|within) (?:\d+|one|two|three|four|five|six|a few|few|a|an|bullet|short|brief|"
+         r"simple|plain|easy)(?: [a-z]+){0,4})?")
 
-from retrieve_generate import retrieve, generate_answer, build_context_block, get_all_summaries  # noqa: E402
+_LEAD_FILLER = re.compile(
+    r"^(?:hey|hi|hello|ok|okay|so|please|pls|kindly|can you|could you|would you|will you|can u|could u|"
+    r"i want you to|i need you to|i would like you to|i want to|lets|let us|just)\s+")
+_TRAIL_FILLER = re.compile(
+    r"\s+(?:please|pls|thanks|thank you|for me|to me|briefly|quickly|in detail|in short|in brief|"
+    r"in simple terms|in simple words|in simple language|in easy words|simply|clearly|properly|"
+    r"completely|fully|thoroughly|now|again)$")
 
-DOC = r"(?:doc|docs|document|documents|pdf|pdfs|file|files|paper|papers|report|resume|resumé|cv|upload(?:ed)?|attachment|text|content|material|notes)"
-THIS = r"(?:this|the|my|that|these|those|uploaded|attached|current|above)"
+_VERBS = (r"(?:summari[sz]e|explain|describe|analy[sz]e|review|interpret|break down|walk through|"
+          r"go through|go over|run through|read|understand|make sense of|walk me through|take me through|"
+          r"help me understand|help me make sense of|help me with)")
 
-META_QUERY_PATTERNS = [re.compile(p) for p in (
-    # summarize / summarise / summary / sum up / recap / tldr
-    rf"\bsummar(?:i[sz]e|y|ies|i[sz]ing)\b.*\b{DOC}\b",
-    rf"\b{DOC}\b.*\bsummar(?:i[sz]e|y|ies)\b",
-    r"^\s*(?:please\s+)?(?:give|show|write|provide|create|make|get)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+)?(?:quick\s+|short\s+|brief\s+|detailed\s+|full\s+)?(?:summary|overview|synopsis|recap|abstract|gist)\b",
-    r"^\s*(?:please\s+)?summar(?:i[sz]e|y)\s*(?:it|this|that|please|pls)?\s*[.!?]*\s*$",
-    r"\b(?:sum\s+(?:it|this|that)\s+up|sum\s+up\b|in\s+a\s+nutshell|key\s+(?:points|takeaways|highlights)|main\s+(?:points|ideas|takeaways)|tl;?\s?dr|tldr|gist\s+of|short\s+version|quick\s+version)",
-    # explain / describe / walk through
-    rf"\b(?:explain|describe|break\s*down|walk\s+me\s+through|go\s+through|go\s+over|run\s+through|analy[sz]e|review|interpret)\b.*\b{THIS}?\s*{DOC}\b",
-    r"^\s*(?:please\s+)?explain\s*(?:it|this|that|everything)?\s*(?:to\s+me)?\s*(?:please|pls)?\s*[.!?]*\s*$",
-    # what is it about
-    rf"\bwhat(?:'s|\s+is|\s+does)\b.*\b{DOC}\b.*\b(?:about|say|contain|cover|discuss|mean)\b",
-    rf"\bwhat(?:'s|\s+is)\s+in\s+{THIS}\s+{DOC}\b",
-    r"^\s*what(?:'s|\s+is)\s+(?:this|it)\s+about\s*\??\s*$",
-    rf"\b(?:tell|teach|brief|fill)\s+me\s+(?:about|on|in\s+on)\s+{THIS}\s+{DOC}\b",
-    rf"\b(?:overview|synopsis|outline|gist|abstract)\s+of\s+{THIS}\s+{DOC}\b",
-    rf"\b(?:main|central|core|key)\s+(?:topic|idea|theme|point|purpose|subject)s?\s+of\s+{THIS}\s+{DOC}\b",
-    rf"\bwhat\s+(?:topics|is\s+the\s+topic|is\s+the\s+purpose|is\s+the\s+main\s+idea|is\s+the\s+subject|are\s+the\s+main\s+points)\b",
-    rf"\bwhat\s+(?:did\s+i|have\s+i)\s+(?:just\s+)?upload(?:ed)?\b",
-    rf"\b(?:help\s+me\s+)?(?:understand|make\s+sense\s+of)\s+{THIS}\s+{DOC}\b",
-    rf"\b(?:what\s+should\s+i\s+know|what\s+do\s+i\s+need\s+to\s+know)\s+(?:about|from)\s+{THIS}\s+{DOC}\b",
-    rf"\bi\s+(?:don'?t|do\s+not)\s+understand\s+{THIS}\s+{DOC}\b",
-    rf"\b(?:read|look\s+at|check)\s+{THIS}\s+{DOC}\b.*\b(?:tell|explain|summar)",
-    rf"\bwhat\s+is\s+{THIS}\s+{DOC}\s*\??\s*$",
-    rf"\bwhat\s+kind\s+of\s+{DOC}\s+is\s+(?:this|it)\b",
+_META_PATTERNS = [re.compile(p) for p in (
+    # "summarize this pdf", "explain the document", "analyze my resume in 5 bullets"
+    rf"^{_VERBS} {_THIS_DOC}{_TAIL}$",
+    # bare commands: "summarize", "summarize this", "explain this", "tldr", "sum it up"
+    r"^(?:summari[sz]e|summari[sz]e (?:this|it)|explain|explain (?:this|everything)|summary|overview|recap|"
+    r"tldr|tl dr|gist|sum up|sum it up|sum this up|in a nutshell)$",
+    # "give me a summary", "a quick overview of this pdf"
+    rf"^(?:give|show|write|provide|create|make|get)(?: me)? (?:a |an |the |some )?(?:quick |short |brief |detailed |"
+    rf"full |one line |one paragraph |high level |rough )?(?:summary|overview|synopsis|recap|abstract|gist|rundown|"
+    rf"outline)(?: of (?:{_THIS_DOC}|it|this))?{_TAIL}$",
+    rf"^(?:summary|overview|synopsis|recap|abstract|gist|rundown|outline) of {_THIS_DOC}$",
+    # "what is this pdf about", "what's in this file", "what does this document say"
+    rf"^what(?: is|s) {_THIS_DOC}(?: all)?(?: about)?$",
+    r"^what(?: is|s) (?:this|it) about$",
+    r"^what(?: is|s) (?:this|it) all about$",
+    rf"^what (?:does|did|do) {_THIS_DOC} (?:say|contain|cover|discuss|talk about|include|mean)$",
+    rf"^what(?: is|s) in {_THIS_DOC}$",
+    rf"^what kind of {_DOC} is (?:this|it)$",
+    rf"^what type of {_DOC} is (?:this|it)$",
+    r"^what did i (?:just )?upload(?:ed)?$",
+    rf"^what(?: is|s) the (?:main (?:idea|point|topic|theme|purpose|subject)|gist|topic|purpose|subject)(?: of {_THIS_DOC})?$",
+    rf"^(?:key|main) (?:points|takeaways|ideas|highlights|topics)(?: of {_THIS_DOC})?$",
+    rf"^what are the (?:key|main) (?:points|takeaways|ideas|highlights|topics)(?: of {_THIS_DOC})?$",
+    rf"^(?:tell|teach|brief|fill) me (?:about|on|in on) {_THIS_DOC}$",
+    rf"^i (?:dont|do not) understand {_THIS_DOC}$",
+    rf"^(?:what )?(?:should|do) i (?:need to )?know (?:about|from) {_THIS_DOC}$",
+    rf"^{_THIS_DOC}(?: summary| overview)$",
 )]
 
 
+def _normalise(query: str) -> str:
+    q = query.lower().replace("\u2019", "'")
+    q = re.sub(r"tl\s*;\s*dr", "tldr", q)
+    q = q.replace("'", "")
+    q = re.sub(r"[^a-z0-9 ]+", " ", q)
+    q = " ".join(q.split())
+    prev = None
+    while prev != q:                       # peel off stacked politeness: "hey can you ... please"
+        prev = q
+        q = _LEAD_FILLER.sub("", q)
+        q = _TRAIL_FILLER.sub("", q)
+    return q
+
+
 def is_meta_query(query: str) -> bool:
-    q = " ".join(query.lower().strip().split())
-    return any(p.search(q) for p in META_QUERY_PATTERNS)
+    q = _normalise(query)
+    return bool(q) and any(p.match(q) for p in _META_PATTERNS)
+
 
 def check_meta_node(state: RAGState) -> RAGState:
     return state  # pass-through, exists purely as a routing point
 
 
 def summary_node(state: RAGState) -> RAGState:
-    summaries = get_all_summaries(state["collection_name"])
-    if not summaries:
-        state["final_output"] = "No documents have been ingested into this collection yet."
+    try:
+        summaries = get_summaries(state["collection_name"], state.get("source"))
+        error = None
+    except Exception as e:  # LLM down / rate-limited on every model
+        summaries, error = {}, str(e)
+
+    if error:
+        state["final_output"] = f"I couldn't generate the summary right now ({error}). Please try again in a moment."
+    elif not summaries:
+        state["final_output"] = "No documents have been ingested yet — upload a PDF and click Ingest first."
     elif len(summaries) == 1:
         state["final_output"] = next(iter(summaries.values()))
     else:
-        state["final_output"] = "\n\n".join(f"{src}: {summ}" for src, summ in summaries.items())
+        state["final_output"] = "\n\n".join(f"**{src}**\n{summ}" for src, summ in summaries.items())
 
     state["chunks"] = []
     state["sub_queries"] = []
@@ -94,8 +128,8 @@ def summary_node(state: RAGState) -> RAGState:
     state["verdict"] = "summary"
     state["confidence"] = {"label": "n/a", "score": None, "best_rerank_score": None}
     state["critique_reason"] = (
-        "Answered from a summary generated at ingestion time; the retrieval "
-        "and critic loop is skipped for whole-document questions."
+        "Answered from a document summary; the retrieval and critic loop is "
+        "skipped for whole-document questions."
     )
     return state
 
@@ -103,8 +137,10 @@ def summary_node(state: RAGState) -> RAGState:
 def route_entry(state: RAGState) -> str:
     return "summary" if is_meta_query(state["original_query"]) else "decompose"
 
-#---------------------------------------------------------------------------------------------
-#---------------------------------------------------------------------------------------------
+
+def route_after_decompose(state: RAGState) -> str:
+    return "summary" if state["sub_queries"] == [WHOLE_DOC_MARKER] else "retrieve"
+
 
 # ---------------------------------------------------------------------
 # Nodes
@@ -112,7 +148,12 @@ def route_entry(state: RAGState) -> str:
 
 def decompose_node(state: RAGState) -> RAGState:
     decompose_prompt = (
-        "Read the following question. If it asks for MULTIPLE distinct "
+        "FIRST CHECK: if the question asks for a general summary, overview or "
+        "explanation of the WHOLE document (for example 'what is this about', "
+        "'explain this pdf', 'give me the gist') and names NO specific topic, "
+        "section, fact or entity, output exactly "
+        f"{WHOLE_DOC_MARKER} and nothing else.\n"
+        "Otherwise, read the question. If it asks for MULTIPLE distinct "
         "facts, or requires comparing/synthesizing information across "
         "different topics or sections, split it into 2-3 focused "
         "sub-questions that together would answer it.\n"
@@ -129,11 +170,11 @@ def decompose_node(state: RAGState) -> RAGState:
         "attribute. Output it UNCHANGED as one question — a document section "
         "usually covers one entity's details together in one place, and "
         "splitting by attribute often uses wording that doesn't match how the "
-        "source text is actually phrased."
+        "source text is actually phrased.\n"
         "When splitting by entity for a comparison, keep each sub-question broad "
         "(e.g. 'What are zoospores?') rather than repeating all the comparison "
         "attributes in each one — this matches short, self-contained document "
-        "sections better than an attribute-heavy phrasing does."
+        "sections better than an attribute-heavy phrasing does.\n"
         "If it is already a single, focused question, output it UNCHANGED as "
         "the only line. Output ONLY the sub-question(s), one per line, no "
         f"numbering, no explanation.\n\nQuestion: {state['original_query']}"
@@ -142,19 +183,20 @@ def decompose_node(state: RAGState) -> RAGState:
         messages=[{"role": "user", "content": decompose_prompt}],
         temperature=0.0,
     )
-    sub_queries = [
-        line.strip() for line in response.choices[0].message.content.strip().split("\n")
-        if line.strip()
-    ]
+    raw = re.sub(r"<think>.*?</think>", "", response.choices[0].message.content or "", flags=re.DOTALL)
+    sub_queries = [line.strip() for line in raw.strip().split("\n") if line.strip()]
+    if any(WHOLE_DOC_MARKER in sq for sq in sub_queries):
+        sub_queries = [WHOLE_DOC_MARKER]
     state["sub_queries"] = sub_queries or [state["original_query"]]
     state["query"] = state["original_query"]
     return state
+
 
 def retrieve_node(state: RAGState) -> RAGState:
     queries_to_run = state["sub_queries"] if state["retry_count"] == 0 else [state["query"]]
     merged: dict = {}
     for q in queries_to_run:
-        for chunk in retrieve(q, state["collection_name"], top_k=6):
+        for chunk in retrieve(q, state["collection_name"], top_k=6, source=state.get("source")):
             key = (chunk["source"], chunk["page"], chunk["text"])
             if key not in merged or chunk["rerank_score"] > merged[key]["rerank_score"]:
                 merged[key] = chunk
@@ -292,7 +334,6 @@ def reformulate_node(state: RAGState) -> RAGState:
     state["retry_count"] += 1
     return state
 
-
 def finalize_grounded_node(state: RAGState) -> RAGState:
     state["final_output"] = state["answer"]
     return state
@@ -301,7 +342,8 @@ def finalize_grounded_node(state: RAGState) -> RAGState:
 def finalize_fallback_node(state: RAGState) -> RAGState:
     state["final_output"] = (
         "I don't have enough information in the provided document(s) to "
-        "answer this question confidently. "
+        "answer this question confidently. If you wanted a general overview "
+        "instead, try asking: \"summarize this document\". "
         f"(Attempted {state['retry_count']} query reformulation(s); "
         f"last critic note: {state['critique_reason']})"
     )
@@ -309,7 +351,7 @@ def finalize_fallback_node(state: RAGState) -> RAGState:
 
 
 # ---------------------------------------------------------------------
-# Conditional routing after generate — catches refusals before the critic
+# conditional routing after generate — catches refusals before the critic
 # ever sees them, so an honest "I don't know" never gets labeled "grounded"
 # ---------------------------------------------------------------------
 def route_after_generate(state: RAGState) -> str:
@@ -321,7 +363,7 @@ def route_after_generate(state: RAGState) -> str:
 
 
 # ---------------------------------------------------------------------
-# Conditional routing after the critic node
+# after critic node conditional routing 
 # ---------------------------------------------------------------------
 def route_after_critique(state: RAGState) -> str:
     if state["verdict"] == "grounded":
@@ -336,12 +378,10 @@ def route_after_critique(state: RAGState) -> str:
 # ---------------------------------------------------------------------
 def build_graph():
     graph = StateGraph(RAGState)
-    
+
     graph.add_node("check_meta", check_meta_node)
     graph.add_node("summary", summary_node)
-    
     graph.add_node("decompose", decompose_node)
-
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("generate", generate_node)
     graph.add_node("critique", critique_node)
@@ -351,34 +391,22 @@ def build_graph():
 
     graph.set_entry_point("check_meta")
     graph.add_conditional_edges(
-        "check_meta", 
-        route_entry, 
-        {
-            "summary": "summary", 
-            "decompose": "decompose",
-        },
+        "check_meta", route_entry, {"summary": "summary", "decompose": "decompose"},
     )
-    graph.add_edge("decompose", "retrieve")
+    graph.add_conditional_edges(
+        "decompose", route_after_decompose, {"summary": "summary", "retrieve": "retrieve"},
+    )
     graph.add_edge("retrieve", "generate")
 
     graph.add_conditional_edges(
         "generate",
         route_after_generate,
-        {
-            "critique": "critique",
-            "retry": "reformulate",
-            "give_up": "finalize_fallback",
-        },
+        {"critique": "critique", "retry": "reformulate", "give_up": "finalize_fallback"},
     )
-
     graph.add_conditional_edges(
         "critique",
         route_after_critique,
-        {
-            "grounded": "finalize_grounded",
-            "retry": "reformulate",
-            "give_up": "finalize_fallback",
-        },
+        {"grounded": "finalize_grounded", "retry": "reformulate", "give_up": "finalize_fallback"},
     )
 
     graph.add_edge("reformulate", "retrieve")   # the self-healing loop
@@ -392,13 +420,15 @@ def build_graph():
 rag_app = build_graph()
 
 
-def ask(query: str, collection_name: str = "documents") -> dict:
-    """Public entry point: run the full self-healing RAG graph on a query."""
+def ask(query: str, collection_name: str = "documents", source: Optional[str] = None) -> dict:
+    """Public entry point: run the full self-healing RAG graph on a query.
+    `source` limits the search to one document; None searches the whole collection."""
     initial_state: RAGState = {
         "sub_queries": [],
         "original_query": query,
         "query": query,
         "collection_name": collection_name,
+        "source": source,
         "chunks": [],
         "answer": "",
         "verdict": "",
@@ -407,9 +437,7 @@ def ask(query: str, collection_name: str = "documents") -> dict:
         "confidence": {"label": "none", "score": 0.0, "best_rerank_score": None},
         "final_output": "",
     }
-
-    final_state = rag_app.invoke(initial_state)
-    return final_state
+    return rag_app.invoke(initial_state)
 
 
 if __name__ == "__main__":
