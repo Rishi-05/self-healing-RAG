@@ -1,18 +1,26 @@
+import html
 import re
 import sys
+import tempfile
 import time
+import uuid
 from pathlib import Path
 
 import streamlit as st
-import tempfile
+
 sys.path.append(str(Path(__file__).parent / "ingestion"))
 sys.path.append(str(Path(__file__).parent / "graph"))
 
-from ingest import ingest_pdf                        # noqa: E402
+from ingest import ingest_pdf                         # noqa: E402
+from retrieve_generate import invalidate_bm25_cache   # noqa: E402
 from self_healing_graph import ask                    # noqa: E402
-from retrieve_generate import invalidate_bm25_cache    # noqa: E402
+from store import list_sources                        # noqa: E402
 
-COLLECTION_NAME = "documents"
+# True  -> every browser session gets its OWN private collection (visitors can't see
+#          each other's uploads; documents are gone when the session ends).
+# False -> one shared collection "documents" (fine for local use, NOT for a public demo).
+ISOLATE_SESSIONS = True
+SCOPE_ALL = "All documents"
 
 CONFIDENCE_DOT_COLOR = {
     "high": "#1F9D8A",
@@ -135,17 +143,41 @@ st.markdown(
 )
 st.write("")
 
+# --- Session state ---
 if "history" not in st.session_state:
     st.session_state.history = []
 if "last_result" not in st.session_state:
     st.session_state.last_result = None
 if "last_elapsed" not in st.session_state:
     st.session_state.last_elapsed = 0.0
+if "collection_name" not in st.session_state:
+    st.session_state.collection_name = (
+        f"docs_{uuid.uuid4().hex[:12]}" if ISOLATE_SESSIONS else "documents"
+    )
+if "sources" not in st.session_state:
+    st.session_state.sources = [] if ISOLATE_SESSIONS else list_sources("documents")
+
+COLLECTION_NAME = st.session_state.collection_name
+
+
+def esc(text) -> str:
+    """Everything that came from a user or an LLM is escaped before going into HTML."""
+    return html.escape(str(text))
+
+
+def render_text(text: str) -> str:
+    """Escape, then re-apply the little formatting we want: bold, bullets, line breaks,
+    and [[Source n]] markers shown as small [n] superscripts."""
+    out = html.escape(text)
+    out = re.sub(r"\[\[Source\s*(\d+)\]\]", r"<sup>[\1]</sup>", out)
+    out = re.sub(r"(?m)^\s*[-*]\s+", "&bull; ", out)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
+    return out.replace("\n", "<br>")
 
 
 def extract_citation_numbers(text: str) -> list:
-    """Pulls unique [n] citation markers out of generated answer text, in order."""
-    return sorted({int(n) for n in re.findall(r"\[(\d+)\]", text)})
+    """Unique [[Source n]] markers in the answer (the exact format the generator is told to use)."""
+    return sorted({int(n) for n in re.findall(r"\[\[Source\s*(\d+)\]\]", text)})
 
 
 # --- Upload section ---
@@ -157,40 +189,58 @@ with col2:
 
 status_placeholder = st.empty()
 
+
+def show_status(message: str) -> None:
+    status_placeholder.markdown(
+        f"<span class='status-line'>{esc(message)}</span>", unsafe_allow_html=True
+    )
+
+
 if ingest_clicked:
     if pdf_file is None:
-        status_placeholder.markdown(
-            "<span class='status-line'>NO FILE — select a PDF before ingesting</span>",
-            unsafe_allow_html=True,
-        )
+        show_status("NO FILE — select a PDF before ingesting")
     else:
-        status_placeholder.markdown(
-            "<span class='status-line'>Processing... ingesting document</span>",
-            unsafe_allow_html=True,
-        )
+        show_status("Processing... ingesting document")
+        tmp_path = None
         try:
-            tmp_path = Path(tempfile.gettempdir()) / pdf_file.name
-            tmp_path.write_bytes(pdf_file.getvalue())
+            # Random temp name: the uploaded filename is never used as a filesystem path.
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                tmp.write(pdf_file.getvalue())
+                tmp_path = tmp.name
+
             start = time.time()
-            collection = ingest_pdf(str(tmp_path), collection_name=COLLECTION_NAME)
+            info = ingest_pdf(
+                tmp_path,
+                collection_name=COLLECTION_NAME,
+                display_name=Path(pdf_file.name).stem,
+            )
             invalidate_bm25_cache(COLLECTION_NAME)
             elapsed = time.time() - start
-            status_placeholder.markdown(
-                f"<span class='status-line'>INGESTED in {elapsed:.1f}s &middot; "
-                f"{collection.count()} chunks indexed &middot; ready for questions</span>",
-                unsafe_allow_html=True,
-            )
+
+            if info["source"] not in st.session_state.sources:
+                st.session_state.sources.append(info["source"])
+            st.session_state.scope = info["source"]   # "this pdf" = the one just uploaded
+
+            if info["skipped"]:
+                show_status(f"ALREADY INGESTED — '{info['source']}' ({info['chunks']} chunks) is ready for questions")
+            else:
+                note = "" if info["summary_ok"] else " · summary will be generated on your first overview question"
+                show_status(
+                    f"INGESTED '{info['source']}' in {elapsed:.1f}s · "
+                    f"{info['chunks']} chunks indexed · ready for questions{note}"
+                )
         except Exception as e:
-            status_placeholder.markdown(
-                f"<span class='status-line'>INGEST FAILED — {e}</span>",
-                unsafe_allow_html=True,
-            )
+            show_status(f"INGEST FAILED — {e}")
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
 
 st.markdown("---")
 
 # --- Three-pane chat layout: sidebar / chat / active citations ---
 left_col, main_col, right_col = st.columns([1, 3, 1.3], gap="large")
 
+active_source = None
 with left_col:
     st.markdown('<div class="sidebar-title">Self-Healing RAG</div>', unsafe_allow_html=True)
     if st.button("+ New Chat", use_container_width=True):
@@ -198,11 +248,24 @@ with left_col:
         st.session_state.last_result = None
         st.rerun()
 
+    if st.session_state.sources:
+        scope_options = list(reversed(st.session_state.sources)) + [SCOPE_ALL]
+        if st.session_state.get("scope") not in scope_options:
+            st.session_state.scope = scope_options[0]
+        st.selectbox("Ask about", scope_options, key="scope")
+        active_source = None if st.session_state.scope == SCOPE_ALL else st.session_state.scope
+
 with main_col:
+    if not st.session_state.history:
+        st.markdown(
+            "<div class='diag-text'><i>Try: &ldquo;summarize this pdf&rdquo; or ask a specific "
+            "question about the document.</i></div>",
+            unsafe_allow_html=True,
+        )
     for idx, msg in enumerate(st.session_state.history):
         if msg["role"] == "user":
             st.markdown(
-                f'<div class="msg-row user"><div class="bubble user">{msg["content"]}</div></div>',
+                f'<div class="msg-row user"><div class="bubble user">{esc(msg["content"])}</div></div>',
                 unsafe_allow_html=True,
             )
         else:
@@ -211,7 +274,7 @@ with main_col:
             badges_html = f'<div class="citation-badges">{badges}</div>' if badges else ""
             st.markdown(
                 f'<div class="msg-row assistant"><div class="avatar">AI</div>'
-                f'<div class="bubble assistant">{msg["content"]}{badges_html}</div></div>',
+                f'<div class="bubble assistant">{render_text(msg["content"])}{badges_html}</div></div>',
                 unsafe_allow_html=True,
             )
             fcol1, fcol2, _ = st.columns([0.07, 0.07, 0.86])
@@ -244,32 +307,39 @@ with right_col:
         for c in chunks_to_show:
             snippet = c["text"][:160] + ("..." if len(c["text"]) > 160 else "")
             st.markdown(
-                f'<div class="citation-card"><div class="src-name">{c["source"]}</div>'
-                f'<div class="snippet">"{snippet}"</div></div>',
+                f'<div class="citation-card"><div class="src-name">{esc(c["source"])} &middot; p.{esc(c["page"])}</div>'
+                f'<div class="snippet">"{esc(snippet)}"</div></div>',
                 unsafe_allow_html=True,
             )
 
-query = st.chat_input("What does this document say about...?")
+query = st.chat_input("Ask about the document, or say 'summarize this pdf'...")
 
 if query:
     st.session_state.history.append({"role": "user", "content": query})
-    try:
-        start = time.time()
-        result = ask(query, collection_name=COLLECTION_NAME)
-        elapsed = time.time() - start
-        answer = result["final_output"]
-        cite_nums = extract_citation_numbers(answer)
-        st.session_state.history.append(
-            {"role": "assistant", "content": answer, "citation_numbers": cite_nums}
-        )
-        st.session_state.last_result = result
-        st.session_state.last_elapsed = elapsed
-    except Exception as e:
-        error_msg = f"Error: {e}"
-        st.session_state.history.append(
-            {"role": "assistant", "content": error_msg, "citation_numbers": []}
-        )
+    if not st.session_state.sources:
+        st.session_state.history.append({
+            "role": "assistant",
+            "content": "Upload a PDF and click Ingest first, then ask me about it.",
+            "citation_numbers": [],
+        })
         st.session_state.last_result = None
+    else:
+        try:
+            with st.spinner("Thinking..."):
+                start = time.time()
+                result = ask(query, collection_name=COLLECTION_NAME, source=active_source)
+                elapsed = time.time() - start
+            answer = result["final_output"]
+            st.session_state.history.append(
+                {"role": "assistant", "content": answer, "citation_numbers": extract_citation_numbers(answer)}
+            )
+            st.session_state.last_result = result
+            st.session_state.last_elapsed = elapsed
+        except Exception as e:
+            st.session_state.history.append(
+                {"role": "assistant", "content": f"Error: {e}", "citation_numbers": []}
+            )
+            st.session_state.last_result = None
     st.rerun()
 
 # --- Diagnostics for the most recent answer ---
@@ -285,20 +355,21 @@ if st.session_state.last_result:
             f'background:{"#C9861A" if i < result["retry_count"] else "#D8DBE0"};margin-right:4px;"></span>'
             for i in range(2)
         )
-        sub_queries_html = "<br>".join(f"&nbsp;&nbsp;- {sq}" for sq in result["sub_queries"])
+        sub_queries_html = "<br>".join(f"&nbsp;&nbsp;- {esc(sq)}" for sq in result["sub_queries"])
 
         st.markdown(
             f"""<div class='diag-text'>
             <span style="display:inline-block;width:9px;height:9px;border-radius:50%;
             background:{dot_color};margin-right:6px;"></span>
-            <b>CONFIDENCE</b> <code>{conf['label'].upper()}</code>
-            &middot; best rerank score <code>{conf['best_rerank_score']}</code><br><br>
-            <b>VERDICT</b> <code>{(result['verdict'] or '—').upper()}</code><br><br>
+            <b>CONFIDENCE</b> <code>{esc(conf['label'].upper())}</code>
+            &middot; best rerank score <code>{esc(conf['best_rerank_score'])}</code><br><br>
+            <b>VERDICT</b> <code>{esc((result['verdict'] or '—').upper())}</code><br><br>
             <b>RETRIES</b> {retry_dots} {result['retry_count']} / 2<br><br>
-            <b>CRITIC NOTE</b> {result['critique_reason'] or '—'}<br><br>
+            <b>CRITIC NOTE</b> {esc(result['critique_reason'] or '—')}<br><br>
             <b>LATENCY</b> <code>{elapsed:.2f}s</code><br><br>
+            <b>SEARCHED IN</b> <code>{esc(result.get('source') or SCOPE_ALL)}</code><br><br>
             <b>SUB-QUERIES</b><br>{sub_queries_html}<br><br>
-            <b>FINAL QUERY</b> <code>{result['query']}</code>
+            <b>FINAL QUERY</b> <code>{esc(result['query'])}</code>
             </div>""",
             unsafe_allow_html=True,
         )
