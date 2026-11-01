@@ -1,66 +1,25 @@
 import argparse
 import hashlib
-import os
 from pathlib import Path
 
-import chromadb
-from chromadb.utils import embedding_functions
 import pdfplumber
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"   # 80MB, runs on CPU, no cost
-CHROMA_PERSIST_DIR = str(Path(__file__).parent.parent / "data" / "chroma_store")
+from store import get_collection
+from summaries import drop_summary, get_or_create_summary
+
 CHUNK_SIZE = 800          # characters per chunk
 CHUNK_OVERLAP = 150       # overlap so context isn't cut mid-idea
+UPSERT_BATCH = 256        # keeps big PDFs under Chroma's max batch size
 
 
-#---------------------------------------------------------------------------------------------
-#---------------------------------------------------------------------------------------------
-import json
-from groq import Groq
-from dotenv import load_dotenv
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
 
-load_dotenv()
-
-SUMMARY_STORE_PATH = str(Path(__file__).parent.parent / "data" / "summaries.json")
-_groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-
-
-def _load_summaries() -> dict:
-    path = Path(SUMMARY_STORE_PATH)
-    return json.loads(path.read_text()) if path.exists() else {}
-
-
-def _save_summaries(summaries: dict):
-    path = Path(SUMMARY_STORE_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(summaries, indent=2))
-
-
-def generate_document_summary(chunks: list[dict], source_name: str) -> str:
-    """Samples chunks spread across the whole document (not just the top few)
-    so the summary reflects breadth, not just whatever ranks highest."""
-    sample_size = min(len(chunks), 12)
-    step = max(1, len(chunks) // sample_size)
-    sampled = chunks[::step][:sample_size]
-    sample_text = "\n\n".join(c["text"] for c in sampled)
-
-    response = _groq_client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[
-            {"role": "system", "content": (
-                "Summarize what this document is about in 3-5 sentences, based "
-                "on the excerpts below. Be general and factual; do not invent "
-                "details the excerpts don't support."
-            )},
-            {"role": "user", "content": sample_text},
-        ],
-        temperature=0.2,
-    )
-    return response.choices[0].message.content.strip()
-
-#---------------------------------------------------------------------------------------------
-#---------------------------------------------------------------------------------------------
 
 def extract_text_from_pdf(pdf_path: str) -> list[dict]:
     """
@@ -78,10 +37,10 @@ def extract_text_from_pdf(pdf_path: str) -> list[dict]:
     return pages
 
 
-def chunk_pages(pages: list[dict], source_name: str) -> list[dict]:
+def chunk_pages(pages: list[dict], source_name: str, doc_hash: str = "") -> list[dict]:
     """
-    Splits each page's text into overlapping chunks and attaches
-    metadata (source file, page number) needed later for citations.
+    Splits each page's text into overlapping chunks and attaches the metadata
+    (source file, page number, file hash) needed for citations and scoping.
     """
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
@@ -91,13 +50,12 @@ def chunk_pages(pages: list[dict], source_name: str) -> list[dict]:
 
     chunks = []
     for page in pages:
-        page_chunks = splitter.split_text(page["text"])
-        for chunk_text in page_chunks:
+        for idx, chunk_text in enumerate(splitter.split_text(page["text"])):
             # Deterministic ID so re-ingesting the same PDF doesn't duplicate.
-            # Hash the FULL chunk text (not just a prefix) to avoid collisions
-            # between different chunks that happen to start identically.
+            # The index is part of the hash: identical text repeated on one page
+            # (headers, boilerplate) used to produce duplicate IDs and crash upsert.
             chunk_id = hashlib.md5(
-                f"{source_name}-{page['page_number']}-{chunk_text}".encode()
+                f"{source_name}-{page['page_number']}-{idx}-{chunk_text}".encode()
             ).hexdigest()
             chunks.append({
                 "id": chunk_id,
@@ -105,53 +63,85 @@ def chunk_pages(pages: list[dict], source_name: str) -> list[dict]:
                 "metadata": {
                     "source": source_name,
                     "page": page["page_number"],
+                    "doc_hash": doc_hash,
                 },
             })
     return chunks
 
 
-def source_already_ingested(collection, source_name: str) -> bool:
-    """Checks if any chunks from this source filename already exist."""
-    existing = collection.get(where={"source": source_name}, limit=1)
-    return len(existing["ids"]) > 0
+def _resolve_source(collection, stem: str, doc_hash: str) -> tuple[str, bool]:
+    """
+    Decides the stored name for this file and whether it's already ingested.
+      - same name + same content (or legacy chunks with no hash) -> already ingested
+      - same name but DIFFERENT content -> stored as '<name>-<hash6>' so it never
+        gets silently skipped or overwritten.
+    """
+    for candidate in (stem, f"{stem}-{doc_hash[:6]}"):
+        got = collection.get(where={"source": candidate}, include=["metadatas"], limit=1)
+        if not got["ids"]:
+            return candidate, False
+        stored = (got["metadatas"][0] or {}).get("doc_hash")
+        if stored is None or stored == doc_hash:
+            return candidate, True
+    return f"{stem}-{doc_hash[:6]}", True
 
 
-def ingest_pdf(pdf_path: str, collection_name: str = "documents", force: bool = False):
-    source_name = Path(pdf_path).stem
+def ingest_pdf(pdf_path: str, collection_name: str = "documents",
+               force: bool = False, display_name: str | None = None) -> dict:
+    """
+    Returns {"collection", "source", "chunks", "total_chunks", "skipped", "summary_ok"}.
+    `display_name` lets the web app pass the user's original filename while the
+    PDF itself sits in a temp file with a random name.
+    """
+    stem = display_name or Path(pdf_path).stem
+    doc_hash = file_sha256(pdf_path)
+    collection = get_collection(collection_name)
 
-    client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
-    embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
-    collection = client.get_or_create_collection(
-        name=collection_name, embedding_function=embed_fn, metadata={"hnsw:space": "cosine"}
-    )
+    source, exists = _resolve_source(collection, stem, doc_hash)
 
-    if not force and source_already_ingested(collection, source_name):
-        print(f"⚠️  '{source_name}' already has chunks in '{collection_name}'. "
-              f"Skipping re-ingestion. Use --force to re-ingest anyway.")
-        return collection
+    if exists and not force:
+        n = len(collection.get(where={"source": source}, include=[])["ids"])
+        return {"collection": collection_name, "source": source, "chunks": n,
+                "total_chunks": collection.count(), "skipped": True, "summary_ok": True}
 
-    print(f"[1/3] Extracting text from {pdf_path} ...")
+    if exists and force:
+        collection.delete(where={"source": source})
+        drop_summary(collection_name, source)
+
+    print(f"[1/4] Extracting text from {pdf_path} ...")
     pages = extract_text_from_pdf(pdf_path)
+    if not pages:
+        raise ValueError(
+            "No extractable text found. This looks like a scanned/image-only PDF — "
+            "it needs OCR before it can be indexed."
+        )
     print(f"      -> {len(pages)} pages with extractable text")
 
-    print(f"[2/3] Chunking (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}) ...")
-    chunks = chunk_pages(pages, source_name)
+    print(f"[2/4] Chunking (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}) ...")
+    chunks = chunk_pages(pages, source, doc_hash)
     print(f"      -> {len(chunks)} chunks")
 
-    print(f"[3/3] Embedding + storing in ChromaDB collection '{collection_name}' ...")
-    collection.upsert(
-        ids=[c["id"] for c in chunks],
-        documents=[c["text"] for c in chunks],
-        metadatas=[c["metadata"] for c in chunks],
-    )
-    print(f"      -> Done. Collection now has {collection.count()} total chunks.")
-    print(f"[4/4] Generating document summary ...")
-    summary = generate_document_summary(chunks, source_name)
-    summaries = _load_summaries()
-    summaries[source_name] = summary
-    _save_summaries(summaries)
-    print("      -> Summary cached.")
-    return collection
+    print(f"[3/4] Embedding + storing in collection '{collection_name}' ...")
+    for i in range(0, len(chunks), UPSERT_BATCH):
+        batch = chunks[i:i + UPSERT_BATCH]
+        collection.upsert(
+            ids=[c["id"] for c in batch],
+            documents=[c["text"] for c in batch],
+            metadatas=[c["metadata"] for c in batch],
+        )
+
+    # The summary is a bonus at this point: if the LLM is rate-limited, ingestion
+    # still succeeds and the summary is generated on the first overview question.
+    print("[4/4] Generating document summary ...")
+    summary_ok = True
+    try:
+        get_or_create_summary(collection_name, source)
+    except Exception as e:
+        summary_ok = False
+        print(f"      -> summary skipped for now ({e})")
+
+    return {"collection": collection_name, "source": source, "chunks": len(chunks),
+            "total_chunks": collection.count(), "skipped": False, "summary_ok": summary_ok}
 
 
 if __name__ == "__main__":
@@ -161,4 +151,9 @@ if __name__ == "__main__":
     parser.add_argument("--force", action="store_true", help="Re-ingest even if source already exists")
     args = parser.parse_args()
 
-    ingest_pdf(args.pdf_path, args.collection, force=args.force)
+    info = ingest_pdf(args.pdf_path, args.collection, force=args.force)
+    if info["skipped"]:
+        print(f"'{info['source']}' is already in '{info['collection']}'. Use --force to re-ingest.")
+    else:
+        print(f"Done: {info['chunks']} chunks from '{info['source']}' "
+              f"({info['total_chunks']} total in '{info['collection']}').")
