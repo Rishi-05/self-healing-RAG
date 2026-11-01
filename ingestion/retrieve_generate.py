@@ -1,39 +1,16 @@
-import os
 import re
-from pathlib import Path
+from typing import Optional
 
-import chromadb
-from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
 
 from llm_client import chat_completion
+from store import get_collection
 
 load_dotenv()
 
-
-#---------------------------------------------------------------------------------------------
-#---------------------------------------------------------------------------------------------
-
-import json
-
-def get_all_summaries(collection_name: str = "documents") -> dict:
-    """Returns {source_name: summary} for every document currently in this collection."""
-    path = Path(__file__).parent.parent / "data" / "summaries.json"
-    if not path.exists():
-        return {}
-    all_summaries = json.loads(path.read_text())
-    collection = get_collection(collection_name)
-    sources_here = {m["source"] for m in collection.get(include=["metadatas"])["metadatas"]}
-    return {k: v for k, v in all_summaries.items() if k in sources_here}
-
-#---------------------------------------------------------------------------------------------
-#---------------------------------------------------------------------------------------------
-
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-CHROMA_PERSIST_DIR = str(Path(__file__).parent.parent / "data" / "chroma_store")
 
 # Reranker score threshold — the cross-encoder outputs an unbounded relevance
 # logit (roughly: >2 = strong match, 0 to 2 = plausible, <0 = weak/irrelevant).
@@ -49,23 +26,6 @@ CANDIDATE_POOL_SIZE = 15
 # Reciprocal Rank Fusion constant — standard default, dampens the influence
 # of any single retriever's exact rank position.
 RRF_K = 60
-
-# Cache these once at import time instead of recreating on every retrieve()
-# call — loading the embedding model and reconnecting the DB client repeatedly
-# was slow and unnecessary (Issues 10/11).
-_chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
-_embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
-_collection_cache: dict = {}
-
-
-def get_collection(collection_name: str = "documents"):
-    if collection_name not in _collection_cache:
-        _collection_cache[collection_name] = _chroma_client.get_or_create_collection(
-            name=collection_name,
-            embedding_function=_embed_fn,
-        )
-    return _collection_cache[collection_name]
-
 
 _bm25_cache: dict = {}   # collection_name -> (BM25Okapi, [chunk_dict, ...])
 _cross_encoder = None    # lazy-loaded singleton, ~80MB model
@@ -121,9 +81,20 @@ def invalidate_bm25_cache(collection_name: str):
     _bm25_cache.pop(collection_name, None)
 
 
-def _vector_search(query: str, collection_name: str, pool_size: int) -> list[dict]:
+def _vector_search(query: str, collection_name: str, pool_size: int,
+                   source: Optional[str] = None) -> list[dict]:
     collection = get_collection(collection_name)
-    results = collection.query(query_texts=[query], n_results=pool_size)
+    where = {"source": source} if source else None
+
+    # Ask for no more results than exist (older Chroma versions raise otherwise).
+    if where:
+        n = len(collection.get(where=where, include=[], limit=pool_size)["ids"])
+    else:
+        n = min(pool_size, collection.count())
+    if n == 0:
+        return []
+
+    results = collection.query(query_texts=[query], n_results=n, where=where)
     candidates = []
     for i in range(len(results["documents"][0])):
         candidates.append({
@@ -135,7 +106,8 @@ def _vector_search(query: str, collection_name: str, pool_size: int) -> list[dic
     return candidates
 
 
-def _bm25_search(query: str, collection_name: str, pool_size: int) -> list[dict]:
+def _bm25_search(query: str, collection_name: str, pool_size: int,
+                 source: Optional[str] = None) -> list[dict]:
     if collection_name not in _bm25_cache:
         _build_bm25_index(collection_name)
     bm25, corpus_chunks = _bm25_cache[collection_name]
@@ -145,6 +117,8 @@ def _bm25_search(query: str, collection_name: str, pool_size: int) -> list[dict]
 
     scores = bm25.get_scores(_tokenize(query))
     ranked_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    if source:
+        ranked_indices = [i for i in ranked_indices if corpus_chunks[i]["source"] == source]
     return [corpus_chunks[i] for i in ranked_indices[:pool_size]]
 
 
@@ -170,21 +144,21 @@ def _reciprocal_rank_fusion(vector_results: list[dict], bm25_results: list[dict]
     return [chunk_lookup[cid] for cid in fused_ids]
 
 
-def retrieve(query: str, collection_name: str = "documents", top_k: int = 6,
-             rerank_threshold: float = RERANK_THRESHOLD) -> list[dict]:
-    """
-    Hybrid retrieval: runs vector search AND BM25 keyword search in
-    parallel, fuses the two ranked lists (Reciprocal Rank Fusion), then
-    reranks the fused candidate pool with a cross-encoder for actual
-    query-chunk relevance before returning the final top_k.
 
-    Returns chunks as [{text, source, page, score}, ...] — score is the
-    cross-encoder relevance score (HIGHER is better, unlike the old
-    cosine distance where lower was better). Chunks scoring below
-    rerank_threshold are dropped rather than passed to the LLM as noise.
+def retrieve(query: str, collection_name: str = "documents", top_k: int = 6,
+             rerank_threshold: float = RERANK_THRESHOLD,
+             source: Optional[str] = None) -> list[dict]:
     """
-    vector_candidates = _vector_search(query, collection_name, CANDIDATE_POOL_SIZE)
-    bm25_candidates = _bm25_search(query, collection_name, CANDIDATE_POOL_SIZE)
+    Hybrid retrieval: runs vector search AND BM25 keyword search, fuses the two
+    ranked lists (Reciprocal Rank Fusion), then reranks the fused pool with a
+    cross-encoder before returning the final top_k.
+
+    `source` restricts everything to ONE document (what "this pdf" means).
+    Returns [{text, source, page, rerank_score}, ...] — HIGHER score is better.
+    Chunks scoring below rerank_threshold are dropped rather than passed to the LLM.
+    """
+    vector_candidates = _vector_search(query, collection_name, CANDIDATE_POOL_SIZE, source)
+    bm25_candidates = _bm25_search(query, collection_name, CANDIDATE_POOL_SIZE, source)
 
     if not vector_candidates and not bm25_candidates:
         return []
@@ -231,16 +205,18 @@ def compute_confidence(chunks: list[dict]) -> dict:
 
     return {"label": label, "score": round(best_score, 3), "best_rerank_score": round(best_score, 3)}
 
+
 def build_context_block(chunks: list[dict]) -> str:
     lines = []
     for i, c in enumerate(chunks, start=1):
         lines.append(f"[[Source {i}]] (source: {c['source']}, page {c['page']})\n{c['text']}")
     return "\n\n".join(lines)
 
+
 def generate_answer(query: str, chunks: list[dict]) -> str:
     """
-    Calls the LLM with a strict grounding instruction: answer ONLY from
-    the provided chunks, cite using [n], and explicitly say if the
+    Calls the LLM with a strict grounding instruction: answer ONLY from the
+    provided chunks, cite using [[Source N]], and explicitly say if the
     context doesn't contain the answer.
     """
     context_block = build_context_block(chunks)
@@ -285,9 +261,10 @@ def generate_answer(query: str, chunks: list[dict]) -> str:
     return response.choices[0].message.content
 
 
-def answer_question(query: str, collection_name: str = "documents", top_k: int = 4) -> dict:
+def answer_question(query: str, collection_name: str = "documents", top_k: int = 4,
+                    source: Optional[str] = None) -> dict:
     """End-to-end: retrieve + generate. Returns answer + chunks + confidence."""
-    chunks = retrieve(query, collection_name, top_k)
+    chunks = retrieve(query, collection_name, top_k, source=source)
     confidence = compute_confidence(chunks)
 
     if not chunks:
